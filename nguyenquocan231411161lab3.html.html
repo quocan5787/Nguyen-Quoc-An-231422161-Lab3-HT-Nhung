@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hệ Thống Giám Sát & Điều Khiển Bể Nuôi Thủy Hải Sản (ESP32 FreeRTOS & MQTT)</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #0f172a;
+      color: #f8fafc;
+    }
+    .water-level-display, .temp-display {
+      font-variant-numeric: tabular-nums;
+      transition: all 0.25s ease;
+    }
+    .btn-actuator {
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .btn-actuator:active {
+      transform: scale(0.97);
+    }
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); }
+      70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+    .active-glow-green {
+      animation: pulse-ring 2s infinite;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <!-- HEADER -->
+  <header class="bg-slate-900/90 border-b border-slate-800 sticky top-0 z-30 backdrop-blur">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-cyan-500/20 border border-cyan-400/40 flex items-center justify-center text-cyan-400 font-bold text-lg">
+          🌊
+        </div>
+        <div>
+          <h1 class="text-lg sm:text-xl font-bold text-white tracking-tight">
+            Giám Sát Môi Trường Bể Nuôi Thủy, Hải Sản
+          </h1>
+          <p class="text-xs text-slate-400">
+            ESP32 Dual-Core FreeRTOS • Cảm biến HC-SR04 &amp; Nhiệt độ DHT22 • EMQX MQTT Broker
+          </p>
+        </div>
+      </div>
+
+      <!-- Trạng thái kết nối MQTT & Chế độ Demo -->
+      <div class="flex flex-wrap items-center gap-2.5">
+        <div id="mqtt-badge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+          <span id="mqtt-dot" class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+          <span id="mqtt-status-text">Đang kết nối EMQX...</span>
+        </div>
+
+        <button id="btn-sim-toggle" type="button" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+          ⚡ Bật Giả Lập Dữ Liệu
+        </button>
+
+        <button id="btn-config-modal" type="button" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 border border-cyan-500/30 transition">
+          ⚙️ Cấu hình MQTT
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN CONTENT -->
+  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+
+    <!-- BANNER TRẠNG THÁI RTOS & THUẬT TOÁN -->
+    <section class="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
+      <div class="flex flex-wrap items-center gap-3">
+        <span class="px-2.5 py-1 rounded-md text-xs font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+          Core 0: Task truyền data
+        </span>
+        <span class="px-2.5 py-1 rounded-md text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+          Core 1: Task đọc data &amp; Task cảnh báo
+        </span>
+        <span id="current-rule-badge" class="px-3 py-1 rounded-md text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700">
+          Trạng thái RTOS: Đang chờ dữ liệu từ ESP32 Wokwi...
+        </span>
+      </div>
+
+      <div class="flex items-center gap-3 self-end lg:self-auto">
+        <span class="text-xs text-slate-400">Chế độ vận hành:</span>
+        <span id="mode-indicator" class="px-3 py-1 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+          AUTO (Tự động RTOS)
+        </span>
+        <button id="btn-set-auto" type="button" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shadow transition">
+          🔄 Chuyển về AUTO
+        </button>
+      </div>
+    </section>
+
+    <!-- YÊU CẦU 1: 2 THẺ HTML "CLASS" HIỂN THỊ DỮ LIỆU MỰC NƯỚC VÀ NHIỆT ĐỘ BỂ DẠNG SỐ -->
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      
+      <!-- Thẻ HTML 1: Hiển thị dữ liệu Mực nước (khoảng cách HC-SR04) dạng số -->
+      <div class="sensor-card water-level-card bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg relative overflow-hidden">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <span class="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-cyan-400">
+              📏 Cảm biến siêu âm HC-SR04
+            </span>
+            <h2 class="text-base font-semibold text-slate-200 mt-1">
+              Mực Nước Bể Nuôi (Khoảng Cách)
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Thẻ HTML class: <code class="text-cyan-300 bg-slate-800 px-1.5 py-0.5 rounded">.water-level-value</code>
+            </p>
+          </div>
+          <div class="w-12 h-12 rounded-2xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-2xl">
+            💧
+          </div>
+        </div>
+
+        <!-- Giá trị hiển thị dạng số trên thẻ HTML có thuộc tính class -->
+        <div class="mt-5 flex items-baseline gap-3">
+          <div id="water-level-m" class="water-level-value water-level-display text-4xl sm:text-5xl font-bold text-cyan-400">
+            1.20
+          </div>
+          <span class="text-xl font-semibold text-slate-400">m</span>
+          <span class="ml-auto text-sm text-slate-400">
+            (<span id="water-level-cm" class="water-level-cm-value font-semibold text-slate-200">120.0</span> cm)
+          </span>
+        </div>
+
+        <!-- Thanh trực quan hóa mức nước -->
+        <div class="mt-4">
+          <div class="flex justify-between text-xs text-slate-400 mb-1.5">
+            <span>Ngưỡng xả tràn (&lt; 0.5m)</span>
+            <span>An toàn (0.5m - 1.0m)</span>
+            <span>Cần bơm (1.0m - 2.0m)</span>
+          </div>
+          <div class="w-full h-3 bg-slate-800 rounded-full overflow-hidden p-0.5 border border-slate-700">
+            <div id="water-progress-bar" class="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-300" style="width: 60%"></div>
+          </div>
+          <div class="mt-2 flex items-center justify-between text-xs text-slate-400">
+            <span>Độ sâu nước thực tế (Bể 2m): <strong id="actual-depth-m" class="text-slate-200">0.80 m</strong></span>
+            <span id="water-alert-tag" class="text-amber-300 font-medium">Mực nước 1m-1.5m: Bơm 50% (10s)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Thẻ HTML 2: Hiển thị dữ liệu Nhiệt độ bể dạng số -->
+      <div class="sensor-card temp-card bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg relative overflow-hidden">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <span class="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-rose-400">
+              🌡️ Cảm biến nhiệt độ bể (DHT22)
+            </span>
+            <h2 class="text-base font-semibold text-slate-200 mt-1">
+              Nhiệt Độ Môi Trường Nước
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Thẻ HTML class: <code class="text-rose-300 bg-slate-800 px-1.5 py-0.5 rounded">.temperature-value</code>
+            </p>
+          </div>
+          <div class="w-12 h-12 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center text-2xl">
+            🌡️
+          </div>
+        </div>
+
+        <!-- Giá trị hiển thị dạng số trên thẻ HTML có thuộc tính class -->
+        <div class="mt-5 flex items-baseline gap-3">
+          <div id="temp-c" class="temperature-value temp-display text-4xl sm:text-5xl font-bold text-rose-400">
+            24.0
+          </div>
+          <span class="text-xl font-semibold text-slate-400">°C</span>
+          <span id="temp-status-pill" class="ml-auto px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+            Đồng bộ trực tiếp với DHT22
+          </span>
+        </div>
+
+        <!-- Thanh trực quan hóa nhiệt độ -->
+        <div class="mt-4">
+          <div class="flex justify-between text-xs text-slate-400 mb-1.5">
+            <span>Lạnh (&lt; 20°C)</span>
+            <span>Tối ưu (24°C - 30°C)</span>
+            <span>Nóng (&gt; 32°C)</span>
+          </div>
+          <div class="w-full h-3 bg-slate-800 rounded-full overflow-hidden p-0.5 border border-slate-700">
+            <div id="temp-progress-bar" class="h-full bg-gradient-to-r from-amber-400 via-rose-500 to-red-600 rounded-full transition-all duration-300" style="width: 48%"></div>
+          </div>
+          <div class="mt-2 flex items-center justify-between text-xs text-slate-400">
+            <span>Cập nhật lần cuối: <strong id="last-update-time" class="text-slate-200">Đang chờ gói tin...</strong></span>
+            <span>Topic: <code class="text-slate-300">emqx/utc2026/telemetry</code></span>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- YÊU CẦU 2: 2 NÚT "BUTTON" ĐIỀU KHIỂN TRẠNG THÁI MÁY BƠM NƯỚC VÀO & VAN THOÁT NƯỚC RA (MANUAL) -->
+    <section class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-4 border-b border-slate-800">
+        <div>
+          <h2 class="text-base font-bold text-white flex items-center gap-2">
+            🎛️ Bảng Điều Khiển Cơ Cấu Chấp Hành (Chế độ Manual &amp; Thuật Toán RTOS)
+          </h2>
+          <p class="text-xs text-slate-400 mt-0.5">
+            Nhấn vào 2 nút <code class="text-amber-300">&lt;button&gt;</code> bên dưới để gửi lệnh MQTT điều khiển trực tiếp Máy bơm nước VÀO và Van thoát nước RA (chế độ Manual).
+          </p>
+        </div>
+        <div class="text-xs text-slate-400">
+          Topic điều khiển: <code class="px-2 py-0.5 rounded bg-slate-800 text-cyan-300">emqx/utc2026/control</code>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-5">
+        
+        <!-- Nút Button 1: Điều khiển Máy Bơm Nước VÀO -->
+        <div class="bg-slate-950/70 border border-slate-800/90 rounded-xl p-4 flex flex-col justify-between gap-4">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div id="pump-icon-box" class="w-11 h-11 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xl">
+                ⚙️
+              </div>
+              <div>
+                <h3 class="text-sm font-bold text-white">Máy Bơm Nước VÀO (GPIO 26)</h3>
+                <p class="text-xs text-slate-400">Điều chỉnh công suất PWM (0% / 50% / 100%)</p>
+              </div>
+            </div>
+            <div class="text-right">
+              <span id="pump-status-badge" class="px-2.5 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                ĐANG TẮT (0%)
+              </span>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2.5">
+            <button id="btn-pump-manual" type="button" class="btn-actuator pump-control-button flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-emerald-600 hover:bg-emerald-500 text-white shadow-md flex items-center justify-center gap-2">
+              <span>🔌</span>
+              <span id="btn-pump-label">BẬT / TẮT MÁY BƠM NƯỚC VÀO (Manual)</span>
+            </button>
+
+            <button id="btn-pump-50" type="button" class="btn-actuator py-3 px-3 rounded-xl font-semibold text-xs bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700">
+              50% PWM
+            </button>
+            <button id="btn-pump-100" type="button" class="btn-actuator py-3 px-3 rounded-xl font-semibold text-xs bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700">
+              100% PWM
+            </button>
+          </div>
+        </div>
+
+        <!-- Nút Button 2: Điều khiển Van Thoát Nước RA -->
+        <div class="bg-slate-950/70 border border-slate-800/90 rounded-xl p-4 flex flex-col justify-between gap-4">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div id="valve-icon-box" class="w-11 h-11 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xl">
+                🚰
+              </div>
+              <div>
+                <h3 class="text-sm font-bold text-white">Van Thoát Nước RA (GPIO 27)</h3>
+                <p class="text-xs text-slate-400">Xả bớt nước khi mực nước &lt; 0.5m hoặc Manual</p>
+              </div>
+            </div>
+            <div class="text-right">
+              <span id="valve-status-badge" class="px-2.5 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                ĐANG ĐÓNG
+              </span>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2.5">
+            <button id="btn-valve-manual" type="button" class="btn-actuator valve-control-button flex-1 py-3 px-4 rounded-xl font-bold text-sm bg-rose-600 hover:bg-rose-500 text-white shadow-md flex items-center justify-center gap-2">
+              <span>🛠️</span>
+              <span id="btn-valve-label">MỞ / ĐÓNG VAN THOÁT NƯỚC RA (Manual)</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Bảng tóm tắt thuật toán RTOS "Task cảnh báo" trên Core 1 -->
+      <div class="mt-5 pt-4 border-t border-slate-800/80">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <span class="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+            📋 Thuật toán RTOS "Task cảnh báo" (Core 1) &amp; Mô phỏng nhanh kịch bản:
+          </span>
+          <span class="text-xs text-slate-400">
+            Bấm vào từng kịch bản bên dưới để kiểm tra phản ứng của hệ thống
+          </span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <button id="btn-test-rule1" type="button" class="text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-slate-800 transition group">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-bold text-cyan-400">✓ Mực nước 1m – 1.5m</span>
+              <span class="text-[11px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 group-hover:bg-cyan-500/20">Thử kịch bản</span>
+            </div>
+            <p class="text-xs text-slate-300 mt-1">Bật <strong>50% công suất</strong> máy bơm, trong <strong>10s</strong>.</p>
+          </button>
+
+          <button id="btn-test-rule2" type="button" class="text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-slate-800 transition group">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-bold text-amber-400">✓ Mực nước 1.5m – 2m</span>
+              <span class="text-[11px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 group-hover:bg-amber-500/20">Thử kịch bản</span>
+            </div>
+            <p class="text-xs text-slate-300 mt-1">Bật <strong>100% công suất</strong> máy bơm, trong <strong>20s</strong>.</p>
+          </button>
+
+          <button id="btn-test-rule3" type="button" class="text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800/80 border border-slate-800 transition group">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-bold text-rose-400">✓ Mực nước &lt; 0.5m</span>
+              <span class="text-[11px] px-2 py-0.5 rounded bg-rose-500/10 text-rose-300 group-hover:bg-rose-500/20">Thử kịch bản</span>
+            </div>
+            <p class="text-xs text-slate-300 mt-1">Bật <strong>Van thoát nước</strong>, trong <strong>10s</strong>.</p>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- YÊU CẦU 3: 2 BIỂU ĐỒ CẬP NHẬT DỮ LIỆU MỰC NƯỚC VÀ NHIỆT ĐỘ BỂ TRỰC TIẾP THEO THỜI GIAN THỰC -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      
+      <!-- Biểu đồ 1: Mực nước bể theo thời gian thực -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h3 class="text-sm font-bold text-white">📈 Biểu Đồ Mực Nước Thời Gian Thực (Real-time)</h3>
+            <p class="text-xs text-slate-400">Đơn vị: mét (m) — Tự động cập nhật khi có gói tin từ MQTT Broker</p>
+          </div>
+          <span class="px-2.5 py-1 rounded-md text-xs font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+            HC-SR04 (m)
+          </span>
+        </div>
+        <div class="relative h-72 w-full">
+          <canvas id="waterLevelChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Biểu đồ 2: Nhiệt độ bể theo thời gian thực -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h3 class="text-sm font-bold text-white">📈 Biểu Đồ Nhiệt Độ Bể Thời Gian Thực (Real-time)</h3>
+            <p class="text-xs text-slate-400">Đơn vị: độ C (°C) — Đồng bộ trực tiếp với cảm biến DHT22 trên Wokwi</p>
+          </div>
+          <span class="px-2.5 py-1 rounded-md text-xs font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/30">
+            DHT22 (°C)
+          </span>
+        </div>
+        <div class="relative h-72 w-full">
+          <canvas id="temperatureChart"></canvas>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- NHẬT KÝ SERIAL & GÓI TIN MQTT -->
+    <section class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+          🖥️ Nhật Ký Giao Tiếp MQTT &amp; Sự Kiện Hệ Thống
+        </h3>
+        <button id="btn-clear-log" type="button" class="text-xs text-slate-400 hover:text-white px-2.5 py-1 rounded bg-slate-800">
+          Xóa nhật ký
+        </button>
+      </div>
+      <div id="mqtt-log-box" class="bg-slate-950 border border-slate-800 rounded-xl p-3 h-40 overflow-y-auto font-mono text-xs text-slate-300 space-y-1.5">
+        <div class="text-cyan-400">[Hệ thống] Đang lắng nghe dữ liệu thực tế từ ESP32 Wokwi...</div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- MODAL CẤU HÌNH MQTT BROKER -->
+  <div id="config-modal" class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm hidden items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between">
+        <h3 class="text-base font-bold text-white">⚙️ Cấu hình kết nối MQTT Broker (WebSockets)</h3>
+        <button id="btn-close-modal" type="button" class="text-slate-400 hover:text-white text-sm font-bold">✕</button>
+      </div>
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-300 mb-1 font-medium">WebSocket Broker URL:</label>
+          <input id="input-broker-url" type="text" value="wss://broker.emqx.io:8084/mqtt" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+        <div>
+          <label class="block text-slate-300 mb-1 font-medium">Topic Nhận dữ liệu (Subscribe):</label>
+          <input id="input-topic-sub" type="text" value="emqx/utc2026/telemetry" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+        <div>
+          <label class="block text-slate-300 mb-1 font-medium">Topic Gửi lệnh điều khiển (Publish):</label>
+          <input id="input-topic-pub" type="text" value="emqx/utc2026/control" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-cancel-modal" type="button" class="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:bg-slate-700">
+          Đóng
+        </button>
+        <button id="btn-save-mqtt" type="button" class="px-4 py-2 rounded-lg text-xs font-semibold bg-cyan-600 text-white hover:bg-cyan-500">
+          Lưu &amp; Kết nối lại
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- JAVASCRIPT XỬ LÝ MQTT, BIỂU ĐỒ CHART.JS & ĐIỀU KHIỂN -->
+  <script>
+    let brokerUrl = "wss://broker.emqx.io:8084/mqtt";
+    let topicTelemetry = "emqx/utc2026/telemetry";
+    let topicControl = "emqx/utc2026/control";
+
+    let mqttClient = null;
+    let isSimulating = false;
+    let simInterval = null;
+    let rtosCountdownTimer = null;
+
+    // Mặc định ban đầu của DHT22 trên Wokwi là 24.0°C
+    let appState = {
+      distanceM: 1.20,
+      distanceCm: 120.0,
+      waterLevelM: 0.80,
+      tempC: 24.0,
+      mode: "AUTO",
+      pump: false,
+      pumpPower: 0,
+      valve: false,
+      alertStatus: "Đang nhận dữ liệu thực từ Wokwi..."
+    };
+
+    function appendLog(message, type = "info") {
+      const logBox = document.getElementById("mqtt-log-box");
+      const timeStr = new Date().toLocaleTimeString("vi-VN");
+      const row = document.createElement("div");
+      let colorClass = "text-slate-300";
+      if (type === "pub") colorClass = "text-amber-300";
+      if (type === "sub") colorClass = "text-emerald-300";
+      if (type === "alert") colorClass = "text-cyan-300";
+      row.className = colorClass;
+      row.textContent = `[${timeStr}] ${message}`;
+      logBox.prepend(row);
+      while (logBox.children.length > 60) {
+        logBox.removeChild(logBox.lastChild);
+      }
+    }
+
+    const maxDataPoints = 20;
+
+    const waterCtx = document.getElementById("waterLevelChart").getContext("2d");
+    const waterChart = new Chart(waterCtx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [{
+          label: "Mực nước / Khoảng cách HC-SR04 (m)",
+          data: [],
+          borderColor: "#22d3ee",
+          backgroundColor: "rgba(34, 211, 238, 0.12)",
+          borderWidth: 2.5,
+          pointRadius: 3,
+          pointBackgroundColor: "#06b6d4",
+          fill: true,
+          tension: 0.35
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: "#cbd5e1", font: { size: 11 } } }
+        },
+        scales: {
+          x: {
+            ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true, maxTicksLimit: 6 },
+            grid: { color: "rgba(148, 163, 184, 0.08)" }
+          },
+          y: {
+            min: 0,
+            max: 2.2,
+            ticks: { color: "#94a3b8" },
+            grid: { color: "rgba(148, 163, 184, 0.1)" }
+          }
+        }
+      }
+    });
+
+    const tempCtx = document.getElementById("temperatureChart").getContext("2d");
+    const tempChart = new Chart(tempCtx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [{
+          label: "Nhiệt độ bể DHT22 (°C)",
+          data: [],
+          borderColor: "#fb7185",
+          backgroundColor: "rgba(251, 113, 133, 0.12)",
+          borderWidth: 2.5,
+          pointRadius: 3,
+          pointBackgroundColor: "#f43f5e",
+          fill: true,
+          tension: 0.35
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: "#cbd5e1", font: { size: 11 } } }
+        },
+        scales: {
+          x: {
+            ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true, maxTicksLimit: 6 },
+            grid: { color: "rgba(148, 163, 184, 0.08)" }
+          },
+          y: {
+            suggestedMin: -10,
+            suggestedMax: 50,
+            ticks: { color: "#94a3b8" },
+            grid: { color: "rgba(148, 163, 184, 0.1)" }
+          }
+        }
+      }
+    });
+
+    function pushChartData(waterM, tempC) {
+      const timeLabel = new Date().toLocaleTimeString("vi-VN");
+
+      waterChart.data.labels.push(timeLabel);
+      waterChart.data.datasets[0].data.push(Number(waterM));
+      if (waterChart.data.labels.length > maxDataPoints) {
+        waterChart.data.labels.shift();
+        waterChart.data.datasets[0].data.shift();
+      }
+      waterChart.update("none");
+
+      tempChart.data.labels.push(timeLabel);
+      tempChart.data.datasets[0].data.push(Number(tempC));
+      if (tempChart.data.labels.length > maxDataPoints) {
+        tempChart.data.labels.shift();
+        tempChart.data.datasets[0].data.shift();
+      }
+      tempChart.update("none");
+    }
+
+    function renderUI() {
+      const waterMEl = document.getElementById("water-level-m");
+      const waterCmEl = document.getElementById("water-level-cm");
+      const actualDepthEl = document.getElementById("actual-depth-m");
+      const waterBar = document.getElementById("water-progress-bar");
+      const waterAlertTag = document.getElementById("water-alert-tag");
+
+      waterMEl.textContent = Number(appState.distanceM).toFixed(2);
+      waterCmEl.textContent = Number(appState.distanceCm).toFixed(1);
+      actualDepthEl.textContent = Number(appState.waterLevelM).toFixed(2) + " m";
+
+      const pctWater = Math.min(100, Math.max(0, (appState.distanceM / 2.0) * 100));
+      waterBar.style.width = pctWater + "%";
+
+      if (appState.distanceM < 0.5) {
+        waterAlertTag.textContent = "Cảnh báo (<0.5m): Mở Van thoát 10s";
+        waterAlertTag.className = "text-rose-400 font-semibold";
+      } else if (appState.distanceM >= 1.0 && appState.distanceM < 1.5) {
+        waterAlertTag.textContent = "Mực nước 1m-1.5m: Bật Bơm 50% (10s)";
+        waterAlertTag.className = "text-cyan-300 font-semibold";
+      } else if (appState.distanceM >= 1.5) {
+        waterAlertTag.textContent = "Mực nước 1.5m-2m: Bật Bơm 100% (20s)";
+        waterAlertTag.className = "text-amber-300 font-semibold";
+      } else {
+        waterAlertTag.textContent = "Mực nước trong ngưỡng ổn định (0.5m - 1.0m)";
+        waterAlertTag.className = "text-emerald-400 font-medium";
+      }
+
+      // Cập nhật thẻ HTML class hiển thị Nhiệt độ bể khớp hoàn toàn với DHT22
+      const tempCEl = document.getElementById("temp-c");
+      const tempBar = document.getElementById("temp-progress-bar");
+      const tempPill = document.getElementById("temp-status-pill");
+
+      tempCEl.textContent = Number(appState.tempC).toFixed(1);
+      // Dải nhiệt độ DHT22 trên Wokwi từ -40°C đến 80°C
+      const pctTemp = Math.min(100, Math.max(0, ((appState.tempC + 40) / 120.0) * 100));
+      tempBar.style.width = pctTemp + "%";
+
+      if (appState.tempC >= 24 && appState.tempC <= 30) {
+        tempPill.textContent = `Tối ưu (${Number(appState.tempC).toFixed(1)}°C)`;
+        tempPill.className = "ml-auto px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30";
+      } else if (appState.tempC > 30) {
+        tempPill.textContent = `Nhiệt độ cao (${Number(appState.tempC).toFixed(1)}°C)`;
+        tempPill.className = "ml-auto px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-500/15 text-rose-300 border border-rose-500/30";
+      } else {
+        tempPill.textContent = `Nhiệt độ thấp (${Number(appState.tempC).toFixed(1)}°C)`;
+        tempPill.className = "ml-auto px-2.5 py-1 rounded-full text-xs font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30";
+      }
+
+      document.getElementById("last-update-time").textContent = new Date().toLocaleTimeString("vi-VN");
+      document.getElementById("current-rule-badge").textContent = "Trạng thái: " + appState.alertStatus;
+
+      const modeEl = document.getElementById("mode-indicator");
+      if (appState.mode === "AUTO") {
+        modeEl.textContent = "AUTO (Tự động RTOS)";
+        modeEl.className = "px-3 py-1 rounded-lg text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
+      } else {
+        modeEl.textContent = "MANUAL (Điều khiển tay)";
+        modeEl.className = "px-3 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40";
+      }
+
+      const pumpBadge = document.getElementById("pump-status-badge");
+      const pumpBtnLabel = document.getElementById("btn-pump-label");
+      const pumpIconBox = document.getElementById("pump-icon-box");
+
+      if (appState.pump || appState.pumpPower > 0) {
+        const pwr = appState.pumpPower > 0 ? appState.pumpPower : 100;
+        pumpBadge.textContent = `ĐANG BẬT (${pwr}% CÔNG SUẤT)`;
+        pumpBadge.className = "px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 active-glow-green";
+        pumpBtnLabel.textContent = "TẮT MÁY BƠM NƯỚC VÀO (Manual)";
+        pumpIconBox.className = "w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-xl";
+      } else {
+        pumpBadge.textContent = "ĐANG TẮT (0%)";
+        pumpBadge.className = "px-2.5 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-400 border border-slate-700";
+        pumpBtnLabel.textContent = "BẬT MÁY BƠM NƯỚC VÀO (Manual)";
+        pumpIconBox.className = "w-11 h-11 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xl";
+      }
+
+      const valveBadge = document.getElementById("valve-status-badge");
+      const valveBtnLabel = document.getElementById("btn-valve-label");
+      const valveIconBox = document.getElementById("valve-icon-box");
+
+      if (appState.valve) {
+        valveBadge.textContent = "ĐANG MỞ XẢ NƯỚC";
+        valveBadge.className = "px-2.5 py-1 rounded-full text-xs font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40";
+        valveBtnLabel.textContent = "ĐÓNG VAN THOÁT NƯỚC RA (Manual)";
+        valveIconBox.className = "w-11 h-11 rounded-xl bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-xl";
+      } else {
+        valveBadge.textContent = "ĐANG ĐÓNG";
+        valveBadge.className = "px-2.5 py-1 rounded-full text-xs font-bold bg-slate-800 text-slate-400 border border-slate-700";
+        valveBtnLabel.textContent = "MỞ VAN THOÁT NƯỚC RA (Manual)";
+        valveIconBox.className = "w-11 h-11 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xl";
+      }
+    }
+
+    function connectMQTT() {
+      if (mqttClient) {
+        try { mqttClient.end(true); } catch (e) {}
+      }
+
+      const badge = document.getElementById("mqtt-badge");
+      const dot = document.getElementById("mqtt-dot");
+      const statusText = document.getElementById("mqtt-status-text");
+
+      badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30";
+      dot.className = "w-2 h-2 rounded-full bg-amber-400 animate-ping";
+      statusText.textContent = "Đang kết nối EMQX...";
+
+      const clientId = "web_aquaculture_" + Math.random().toString(16).substring(2, 10);
+
+      try {
+        mqttClient = mqtt.connect(brokerUrl, {
+          clientId: clientId,
+          username: "emqx_user",
+          password: "public",
+          clean: true,
+          connectTimeout: 5000,
+          reconnectPeriod: 3000
+        });
+
+        mqttClient.on("connect", () => {
+          badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30";
+          dot.className = "w-2 h-2 rounded-full bg-emerald-400";
+          statusText.textContent = "Đã kết nối EMQX Broker";
+          appendLog(`Đã kết nối tới ${brokerUrl} (Client: ${clientId})`, "sub");
+
+          mqttClient.subscribe(topicTelemetry, (err) => {
+            if (!err) {
+              appendLog(`Đang nhận dữ liệu từ topic: ${topicTelemetry}`, "sub");
+            }
+          });
+        });
+
+        mqttClient.on("message", (topic, message) => {
+          if (topic === topicTelemetry) {
+            try {
+              const data = JSON.parse(message.toString());
+
+              // Nếu người dùng đang bật giả lập mà có dữ liệu thật từ Wokwi gửi tới -> tự tắt giả lập để ưu tiên dữ liệu thật
+              if (isSimulating) {
+                isSimulating = false;
+                if (simInterval) clearInterval(simInterval);
+                const simBtn = document.getElementById("btn-sim-toggle");
+                simBtn.textContent = "⚡ Bật Giả Lập Dữ Liệu";
+                simBtn.className = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition";
+              }
+
+              const distCm = (data.distance !== undefined) ? Number(data.distance) : appState.distanceCm;
+              const distM = (data.distanceM !== undefined) ? Number(data.distanceM) : (distCm / 100.0);
+              const wLevelCm = (data.waterLevel !== undefined) ? Number(data.waterLevel) : (200.0 - distCm);
+              const wLevelM = (data.waterLevelM !== undefined) ? Number(data.waterLevelM) : (wLevelCm / 100.0);
+
+              // Đọc mọi tên trường nhiệt độ có thể gửi từ ESP32 (temp, temperature, nhietdo)
+              let rawTemp = data.temp;
+              if (rawTemp === undefined) rawTemp = data.temperature;
+              if (rawTemp === undefined) rawTemp = data.nhietdo;
+              const parsedTemp = Number(rawTemp);
+
+              appState.distanceCm = distCm;
+              appState.distanceM = distM;
+              appState.waterLevelM = wLevelM;
+              if (!Number.isNaN(parsedTemp)) {
+                appState.tempC = parsedTemp;
+              }
+              appState.mode = data.mode || "AUTO";
+              appState.pump = Boolean(data.pump);
+              appState.pumpPower = (data.pumpPower !== undefined) ? Number(data.pumpPower) : (data.pump ? 100 : 0);
+              appState.valve = Boolean(data.valve);
+              if (data.alertStatus) appState.alertStatus = data.alertStatus;
+
+              renderUI();
+              pushChartData(appState.distanceM, appState.tempC);
+              appendLog(`[MQTT Sub] Mực nước(KC): ${appState.distanceM.toFixed(2)}m | Nhiệt độ DHT22: ${appState.tempC.toFixed(1)}°C | Bơm: ${appState.pumpPower}% | Van: ${appState.valve ? "MỞ" : "ĐÓNG"}`, "sub");
+            } catch (err) {
+              appendLog("Lỗi phân tích JSON từ Broker: " + err.message, "info");
+            }
+          }
+        });
+
+        mqttClient.on("error", (err) => {
+          appendLog("Cảnh báo kết nối MQTT: " + err.message, "info");
+        });
+      } catch (e) {
+        appendLog("Không thể khởi tạo MQTT WebSocket: " + e.message, "info");
+      }
+    }
+
+    function sendControlCommand(cmdName) {
+      const payload = JSON.stringify({ cmd: cmdName });
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(topicControl, payload);
+        appendLog(`[MQTT Pub -> ${topicControl}] ${payload}`, "pub");
+      } else {
+        appendLog(`[Local Manual] Thực thi lệnh tại chỗ: ${payload} (Chưa kết nối Broker)`, "pub");
+      }
+    }
+
+    document.getElementById("btn-pump-manual").addEventListener("click", () => {
+      if (rtosCountdownTimer) clearInterval(rtosCountdownTimer);
+      appState.mode = "MANUAL";
+      const turningOn = !(appState.pump || appState.pumpPower > 0);
+      appState.pump = turningOn;
+      appState.pumpPower = turningOn ? 100 : 0;
+      if (turningOn) appState.valve = false;
+      appState.alertStatus = turningOn ? "Manual: Bật Máy bơm 100% từ Web" : "Manual: Đã tắt Máy bơm từ Web";
+      renderUI();
+      sendControlCommand("PUMP_ON_OFF");
+    });
+
+    document.getElementById("btn-pump-50").addEventListener("click", () => {
+      if (rtosCountdownTimer) clearInterval(rtosCountdownTimer);
+      appState.mode = "MANUAL";
+      appState.pump = true;
+      appState.pumpPower = 50;
+      appState.valve = false;
+      appState.alertStatus = "Manual: Bật Máy bơm 50% công suất";
+      renderUI();
+      sendControlCommand("PUMP_50");
+    });
+
+    document.getElementById("btn-pump-100").addEventListener("click", () => {
+      if (rtosCountdownTimer) clearInterval(rtosCountdownTimer);
+      appState.mode = "MANUAL";
+      appState.pump = true;
+      appState.pumpPower = 100;
+      appState.valve = false;
+      appState.alertStatus = "Manual: Bật Máy bơm 100% công suất";
+      renderUI();
+      sendControlCommand("PUMP_100");
+    });
+
+    document.getElementById("btn-valve-manual").addEventListener("click", () => {
+      if (rtosCountdownTimer) clearInterval(rtosCountdownTimer);
+      appState.mode = "MANUAL";
+      appState.valve = !appState.valve;
+      if (appState.valve) {
+        appState.pump = false;
+        appState.pumpPower = 0;
+      }
+      appState.alertStatus = appState.valve ? "Manual: Mở Van thoát nước từ Web" : "Manual: Đóng Van thoát nước từ Web";
+      renderUI();
+      sendControlCommand("VALVE_ON_OFF");
+    });
+
+    document.getElementById("btn-set-auto").addEventListener("click", () => {
+      appState.mode = "AUTO";
+      appState.alertStatus = "Auto: Đang giám sát theo thuật toán RTOS";
+      renderUI();
+      sendControlCommand("SET_AUTO");
+    });
+
+    function runRtosScenario(distanceM, pumpPower, valveOpen, durationSec, label) {
+      if (rtosCountdownTimer) clearInterval(rtosCountdownTimer);
+      appState.mode = "AUTO";
+      appState.distanceM = distanceM;
+      appState.distanceCm = distanceM * 100;
+      appState.waterLevelM = 2.0 - distanceM;
+      appState.pump = pumpPower > 0;
+      appState.pumpPower = pumpPower;
+      appState.valve = valveOpen;
+
+      let remaining = durationSec;
+      appState.alertStatus = `${label} — Còn lại: ${remaining}s`;
+      renderUI();
+      pushChartData(appState.distanceM, appState.tempC);
+      appendLog(`[RTOS Task Cảnh Báo] Kích hoạt: ${label} (${durationSec}s)`, "alert");
+
+      rtosCountdownTimer = setInterval(() => {
+        remaining--;
+        if (remaining > 0 && appState.mode === "AUTO") {
+          appState.alertStatus = `${label} — Còn lại: ${remaining}s`;
+          renderUI();
+        } else {
+          clearInterval(rtosCountdownTimer);
+          if (appState.mode === "AUTO") {
+            appState.pump = false;
+            appState.pumpPower = 0;
+            appState.valve = false;
+            appState.alertStatus = `Hoàn tất chu kỳ (${durationSec}s) -> Đã ngắt cơ cấu chấp hành`;
+            renderUI();
+            appendLog(`[RTOS Task Cảnh Báo] Đã hết ${durationSec}s -> Tắt cơ cấu chấp hành.`, "alert");
+          }
+        }
+      }, 1000);
+    }
+
+    document.getElementById("btn-test-rule1").addEventListener("click", () => {
+      runRtosScenario(1.25, 50, false, 10, "Mực nước 1.25m (1m-1.5m): Bật Bơm 50%");
+    });
+
+    document.getElementById("btn-test-rule2").addEventListener("click", () => {
+      runRtosScenario(1.75, 100, false, 20, "Mực nước 1.75m (1.5m-2m): Bật Bơm 100%");
+    });
+
+    document.getElementById("btn-test-rule3").addEventListener("click", () => {
+      runRtosScenario(0.35, 0, true, 10, "Mực nước 0.35m (<0.5m): Bật Van thoát");
+    });
+
+    document.getElementById("btn-sim-toggle").addEventListener("click", (e) => {
+      isSimulating = !isSimulating;
+      const btn = e.currentTarget;
+      if (isSimulating) {
+        btn.textContent = "⏹️ Dừng Giả Lập";
+        btn.className = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/30 text-rose-300 border border-rose-500/40 transition";
+        appendLog("Đã bật chế độ giả lập dữ liệu cảm biến tự động mỗi 2 giây.", "info");
+        simInterval = setInterval(() => {
+          const simDist = +(0.3 + Math.random() * 1.6).toFixed(2);
+          const simTemp = +(24.0 + Math.random() * 5.0).toFixed(1);
+          appState.distanceM = simDist;
+          appState.distanceCm = +(simDist * 100).toFixed(1);
+          appState.waterLevelM = +(2.0 - simDist).toFixed(2);
+          appState.tempC = simTemp;
+          renderUI();
+          pushChartData(simDist, simTemp);
+        }, 2000);
+      } else {
+        btn.textContent = "⚡ Bật Giả Lập Dữ Liệu";
+        btn.className = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition";
+        if (simInterval) clearInterval(simInterval);
+        appendLog("Đã tắt chế độ giả lập dữ liệu.", "info");
+      }
+    });
+
+    document.getElementById("btn-clear-log").addEventListener("click", () => {
+      document.getElementById("mqtt-log-box").innerHTML = "";
+    });
+
+    const modal = document.getElementById("config-modal");
+    document.getElementById("btn-config-modal").addEventListener("click", () => {
+      modal.classList.remove("hidden");
+      modal.classList.add("flex");
+    });
+    const closeModal = () => {
+      modal.classList.add("hidden");
+      modal.classList.remove("flex");
+    };
+    document.getElementById("btn-close-modal").addEventListener("click", closeModal);
+    document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+    document.getElementById("btn-save-mqtt").addEventListener("click", () => {
+      brokerUrl = document.getElementById("input-broker-url").value.trim();
+      topicTelemetry = document.getElementById("input-topic-sub").value.trim();
+      topicControl = document.getElementById("input-topic-pub").value.trim();
+      closeModal();
+      connectMQTT();
+    });
+
+    window.addEventListener("load", () => {
+      renderUI();
+      connectMQTT();
+    });
+  </script>
+</body>
+</html>
